@@ -1,6 +1,8 @@
 import os
+import asyncio
+import random
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 import anthropic
 
@@ -16,6 +18,9 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Conversation history per user (in-memory)
 conversation_store: dict[str, list] = {}
+
+# Deduplication: track processed message IDs to avoid double processing
+processed_message_ids: set = set()
 
 SYSTEM_PROMPT = """Tu es l'assistant WhatsApp officiel de DigSM (Digital Success Method), la plateforme d'accompagnement académique de Nestor, fondateur de DigSM.
 
@@ -86,10 +91,16 @@ async def verify_webhook(request: Request):
 
 
 @app.post("/webhook")
-async def receive_message(request: Request):
-    """Receive and process incoming WhatsApp messages"""
+async def receive_message(request: Request, background_tasks: BackgroundTasks):
+    """Receive WhatsApp messages — return 200 immediately, process in background"""
     body = await request.json()
+    # Return 200 immediately so Meta doesn't retry and cause duplicate messages
+    background_tasks.add_task(process_message, body)
+    return {"status": "ok"}
 
+
+async def process_message(body: dict):
+    """Process incoming WhatsApp message and send AI reply"""
     try:
         entry = body.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
@@ -97,22 +108,40 @@ async def receive_message(request: Request):
         messages = value.get("messages", [])
 
         if not messages:
-            return {"status": "ok"}
+            return
 
         message = messages[0]
         if message.get("type") != "text":
-            return {"status": "ok"}
+            return
+
+        # Deduplication: skip if we already processed this message
+        message_id = message.get("id", "")
+        if message_id and message_id in processed_message_ids:
+            print(f"Duplicate message ignored: {message_id}")
+            return
+        if message_id:
+            processed_message_ids.add(message_id)
+            # Keep the set from growing forever (keep last 1000 IDs)
+            if len(processed_message_ids) > 1000:
+                processed_message_ids.clear()
 
         sender_id = message["from"]
         text = message["text"]["body"]
 
         print(f"Message from {sender_id}: {text}")
 
-        # Get or create conversation history
+        # Step 1: Mark message as read (shows blue checkmarks ✓✓ — like a human reading)
+        if message_id:
+            await mark_as_read(message_id)
+
+        # Step 2: Human-like reading delay (2–5 sec, slightly longer for longer messages)
+        reading_delay = random.uniform(2, 5) + min(len(text) / 150, 2)
+        await asyncio.sleep(reading_delay)
+
+        # Step 3: Generate AI response with conversation history
         history = conversation_store.get(sender_id, [])
         history.append({"role": "user", "content": text})
 
-        # Generate AI response with conversation history
         response = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=400,
@@ -127,13 +156,37 @@ async def receive_message(request: Request):
         history.append({"role": "assistant", "content": ai_reply})
         conversation_store[sender_id] = history[-30:]
 
-        # Send reply
+        # Step 4: Typing delay — proportional to reply length (simulates real typing)
+        # ~40 characters per second typing speed, with some randomness
+        typing_delay = random.uniform(1, 3) + len(ai_reply) / 40
+        typing_delay = min(typing_delay, 8)  # cap at 8 seconds max
+        await asyncio.sleep(typing_delay)
+
+        # Step 5: Send reply
         await send_whatsapp_message(sender_id, ai_reply)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error processing message: {e}")
 
-    return {"status": "ok"}
+
+async def mark_as_read(message_id: str):
+    """Mark incoming message as read (shows blue checkmarks to the user)"""
+    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, headers=headers, json=payload)
+            print(f"Mark as read: {r.status_code}")
+    except Exception as e:
+        print(f"Mark as read error: {e}")
 
 
 async def send_whatsapp_message(to: str, text: str):
